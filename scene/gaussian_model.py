@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -31,7 +31,7 @@ class GaussianModel:
             trans[:, 3,:3] = center
             trans[:, 3, 3] = 1
             return trans
-        
+
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -43,7 +43,7 @@ class GaussianModel:
 
     def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -56,9 +56,22 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+
+        # -----------------------------
+        # 🔥🔥 반드시 setup_functions 보다 앞에서 선언해도 되고 뒤에서 선언해도 됨
+        #     하지만 최소한 __init__ 안에는 존재해야 함
+        # -----------------------------
+        self.ray_bins = 24     # ← 너의 설정에 맞게 24로 수정
+        self.ray_contrib = torch.empty(0, device="cuda")  # ← 초기값
+
+        # -----------------------------
+        # GAUSSIAN 활성 함수 초기화 (절대 삭제되면 안됨)
+        # -----------------------------
         self.setup_functions()
 
+
     def capture(self):
+        # ======================= [변경] ray_contrib 까지 함께 저장 =======================
         return (
             self.active_sh_degree,
             self._xyz,
@@ -72,21 +85,43 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.ray_contrib,              # ← 추가
         )
-    
+        # ============================================================================
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        # ======================= [변경] 구버전 체크포인트 호환 + ray_contrib 복원 =======================
+        if len(model_args) == 13:
+            (self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+                self.ray_contrib) = model_args
+        else:
+            # ray_contrib 이 없던 구버전 체크포인트를 로드하는 경우
+            (self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            self.ray_contrib = torch.zeros((self._xyz.shape[0], self.ray_bins), device="cuda")
+        # ============================================================================
+
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -95,25 +130,25 @@ class GaussianModel:
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling) #.clamp(max=1)
-    
+
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
-    
+
     @property
     def get_xyz(self):
         return self._xyz
-    
+
     @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
-    
+
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
 
@@ -132,6 +167,7 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        # ⚠️ 아래 줄을 .repeat(1, 3)으로 변경하면 완전한 3D 스케일(타원체) 사용 가능.
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
 
@@ -144,6 +180,10 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # ======================= [추가] 새로 생성된 Gaussian 수에 맞게 ray_contrib 초기화 =======================
+        self.ray_contrib = torch.zeros((self.get_xyz.shape[0], self.ray_bins), device="cuda")
+        # ============================================================================
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -164,6 +204,13 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+
+        # ======================= [추가] 학습 세팅 시 ray_contrib 리셋 =======================
+        if self.get_xyz.shape[0] > 0:
+            self.ray_contrib = torch.zeros((self.get_xyz.shape[0], self.ray_bins), device="cuda")
+        else:
+            self.ray_contrib = torch.empty(0, device="cuda")
+        # ============================================================================
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -254,6 +301,11 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+        # ======================= [추가] PLY 로드 후에도 ray_contrib 초기화 =======================
+        self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
+        self.ray_contrib = torch.zeros((self._xyz.shape[0], self.ray_bins), device="cuda")
+        # ============================================================================
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -303,6 +355,10 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        # ======================= [추가] 가지치기된 Gaussian 에 맞추어 ray_contrib 도 pruning =======================
+        self.ray_contrib = self.ray_contrib[valid_points_mask]
+        # ============================================================================
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -345,6 +401,14 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+        # ======================= [추가] 새로 densify 된 Gaussian 만큼 ray_contrib 도 확장 =======================
+        self.ray_contrib = torch.cat(
+            [self.ray_contrib,
+             torch.zeros((new_xyz.shape[0], self.ray_bins), device="cuda")],
+            dim=0
+        )
+        # ============================================================================
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -376,7 +440,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -405,3 +469,118 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    # ======================= [추가] 카메라 방향을 bin index 로 변환하는 함수 =======================
+    def direction_to_bin(self, view_dir):
+        """
+        view_dir: (3,) 텐서 (정규화된 벡터)
+        24-bin spherical partition:
+        θ(0~π) → 6등분
+        φ(0~2π) → 4등분
+        총 6 * 4 = 24 bins
+        """
+
+        # normalize
+        v = view_dir / (torch.norm(view_dir) + 1e-8)
+        x, y, z = v
+
+        # spherical coordinates
+        theta = torch.arccos(torch.clamp(z, -1.0, 1.0))         # 0 ~ π
+        phi = torch.atan2(y, x)                                 # -π ~ π
+        if phi < 0:
+            phi += 2 * torch.pi                                 # 0 ~ 2π
+
+        # divide into 6 * 4 grid
+        theta_bin = int(theta / torch.pi * 6)   # 0~5
+        phi_bin   = int(phi / (2 * torch.pi) * 4)  # 0~3
+
+        # final bin index (0~23)
+        bin_id = theta_bin * 4 + phi_bin
+
+        return bin_id
+
+    # ============================================================================
+
+    # ======================= [추가] Per-Ray Signature 업데이트 함수 =======================
+    def update_ray_contrib(self, visibility_filter, view_dir):
+        """
+        visibility_filter : [N] bool 텐서. 이번 뷰에서 실제로 렌더에 기여한 Gaussian 인덱스 마스크.
+        view_dir          : (3,) 텐서. 카메라 forward 방향.
+        => 해당 방향 bin 에 대해서, 보인 가우시안들의 ray_contrib 값을 +1 씩 누적.
+        """
+
+        if self.ray_contrib.numel() == 0:
+            return
+
+        bin_idx = self.direction_to_bin(view_dir)
+
+        vis_idx = visibility_filter.nonzero(as_tuple=False).squeeze(1)
+        if vis_idx.numel() > 0:
+            self.ray_contrib[vis_idx, bin_idx] += 1.0
+    # ============================================================================
+
+    def compress_gaussians(self):
+        """
+        SH 색상/조명(feature) 기반 병합 (시점 기반 병합 제거 버전)
+        """
+
+        if self._xyz.numel() == 0:
+            return
+
+        means = self._xyz.data
+        log_scales = self._scaling.data
+        scales = torch.exp(log_scales)
+        num = means.shape[0]
+
+        # ----- SH feature 벡터 생성 -----
+        with torch.no_grad():
+            f_dc = self._features_dc.data.reshape(num, -1)
+            f_rest = self._features_rest.data.reshape(num, -1)
+            sh_feat = torch.cat([f_dc, f_rest], dim=1)  # [N, F]
+
+        keep = []
+        merged = torch.zeros(num, dtype=torch.bool, device=means.device)
+
+        # ----- 하이퍼파라미터 -----
+        sh_th = 0.5  # 색/조명 특징 거리 임계값 (필요시 조절)
+
+        for i in range(num):
+            if merged[i]:
+                continue
+
+            keep.append(i)
+
+            # 1) 위치 거리
+            s_i = scales[i].mean()
+            dist_th = 0.01 + (0.05 - 0.01) * (s_i / scales.max())
+            dist = torch.norm(means - means[i], dim=1)
+
+            # 2) SH feature 거리 (색상/조명 기반)
+            feat_dist = torch.norm(sh_feat - sh_feat[i], dim=1)
+
+            # ---- 시점 조건(ray_dist) 제거한 버전 ----
+            mask = (dist < dist_th) & (feat_dist < sh_th) & (~merged)
+
+            group_idx = mask.nonzero(as_tuple=False).squeeze(1)
+
+            if len(group_idx) > 1:
+                weights = scales[group_idx].mean(dim=1)
+                W = weights.sum()
+
+                # 위치 병합
+                means[i] = (means[group_idx] * weights[:, None]).sum(0) / W
+
+                # SH feature 병합하고 싶으면(선택)
+                # new_sh = (sh_feat[group_idx] * weights[:, None]).sum(0) / W
+                # sh_feat[i] = new_sh
+
+            merged[group_idx] = True
+            merged[i] = False
+
+        keep_mask = torch.zeros(num, dtype=torch.bool, device=means.device)
+        keep_mask[keep] = True
+
+        self._xyz.data = means
+
+        # pruning
+        self.prune_points(~keep_mask)
